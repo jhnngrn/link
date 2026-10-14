@@ -263,7 +263,7 @@ func (ls *Links) HandleRequest(peer, method string, payload json.RawMessage) (bo
 
 	case "close":
 		if l.State.Refs > 0 {
-			return false, nil
+			return false, fmt.Errorf("close with refs > 0")
 		}
 		ls.Delete(peer)
 		return true, nil
