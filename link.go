@@ -65,6 +65,20 @@ type LinkState struct {
 	Modules map[string]*ConnectionState `json:"modules,omitempty"`
 }
 
+// Module processes sync methods and account API calls for a namespace.
+// HandleRequest returns (ok, kicks, err) where kicks is a list of peers
+// that need kicking on other links (cross-link side effects).
+// HandleResponse returns kicks for the same purpose.
+// HandleAccount handles user-facing API calls.
+// NextTx returns the next queued message to send on a peer, or nil.
+type Module interface {
+	Name() string
+	HandleRequest(peer, method string, payload json.RawMessage, ts int64) (bool, []string, error)
+	HandleResponse(peer, method string, payload json.RawMessage, ok bool, ts int64) []string
+	HandleAccount(method string, payload json.RawMessage) (json.RawMessage, error)
+	NextTx(peer string) *QueuedMsg
+}
+
 // QueuedMsg is a message queued for sending on a link.
 // QueuedAt is a unix-second timestamp of when the message was queued.
 // When multiple modules return a candidate for the same peer, the
