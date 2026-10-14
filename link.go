@@ -66,9 +66,14 @@ type LinkState struct {
 }
 
 // QueuedMsg is a message queued for sending on a link.
+// QueuedAt is a unix-second timestamp of when the message was queued.
+// When multiple modules return a candidate for the same peer, the
+// oldest QueuedAt wins. Zero means unset — unset always loses to any
+// set value; when both are unset (or equal), registration order wins.
 type QueuedMsg struct {
-	Method  string          `json:"method"`
-	Payload json.RawMessage `json:"payload,omitempty"`
+	Method   string          `json:"method"`
+	Payload  json.RawMessage `json:"payload,omitempty"`
+	QueuedAt int64           `json:"queued_at,omitempty"`
 }
 
 // PeerSend tracks the outgoing send lifecycle for a link at a given counter.
