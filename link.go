@@ -243,40 +243,40 @@ func enc(v any) json.RawMessage { d, _ := json.Marshal(v); return d }
 // HandleRequest processes an incoming link-namespace request.
 // Returns (ok, deleteLink, error). When deleteLink is true the caller
 // must remove the link and notify modules.
-func (ls *Links) HandleRequest(peer, method string, payload json.RawMessage) (bool, bool, error) {
+func (ls *Links) HandleRequest(peer, method string, payload json.RawMessage) (bool, error) {
 	l := ls.Get(peer)
 	if l == nil {
-		return false, false, fmt.Errorf("no link to %s", peer)
+		return false, fmt.Errorf("no link to %s", peer)
 	}
 	switch method {
 	case "connect":
 		if l.State.IntentConnect || l.State.Status == Waiting {
 			l.State.Status = Connected
 			l.State.IntentConnect = false
-			return true, false, nil
+			return true, nil
 		}
 		if ls.InviteMode == InviteModeOpen {
 			l.State.Status = Connected
-			return true, false, nil
+			return true, nil
 		}
-		return false, false, nil
+		return false, nil
 
 	case "close":
-		return true, true, nil
+		ls.Delete(peer)
+		return true, nil
 
 	case "module":
 		ok, err := l.reqModule(payload, ls.Supported, ls.InviteMode)
-		return ok, false, err
+		return ok, err
 	}
-	return false, false, fmt.Errorf("unknown link method %q", method)
+	return false, fmt.Errorf("unknown link method %q", method)
 }
 
 // HandleResponse processes a link-namespace response.
-// Returns true when the link should be deleted by the caller.
-func (ls *Links) HandleResponse(peer, method string, payload json.RawMessage, ok bool) bool {
+func (ls *Links) HandleResponse(peer, method string, payload json.RawMessage, ok bool) {
 	l := ls.Get(peer)
 	if l == nil {
-		return false
+		return
 	}
 	switch method {
 	case "connect":
@@ -289,14 +289,14 @@ func (ls *Links) HandleResponse(peer, method string, payload json.RawMessage, ok
 
 	case "close":
 		if ok {
-			return true // caller deletes link
+			ls.Delete(peer)
+		} else {
+			l.State.IntentClose = false
 		}
-		l.State.IntentClose = false
 
 	case "module":
 		l.respModule(payload, ok)
 	}
-	return false
 }
 
 // NextTx returns the next link-level message to send, or nil.
