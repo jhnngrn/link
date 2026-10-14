@@ -17,6 +17,7 @@ var (
 	ErrStaleCounter = errors.New("stale counter")
 	ErrCounterAhead = errors.New("counter ahead")
 	ErrCollision    = errors.New("collision")
+	ErrRefsHeld     = errors.New("close with refs > 0")
 )
 
 // ---------------------------------------------------------------------------
@@ -263,7 +264,7 @@ func (ls *Links) HandleRequest(peer, method string, payload json.RawMessage) (bo
 
 	case "close":
 		if l.State.Refs > 0 {
-			return false, fmt.Errorf("close with refs > 0")
+			return false, ErrRefsHeld
 		}
 		ls.Delete(peer)
 		return true, nil
