@@ -171,6 +171,8 @@ type Links struct {
 	Protected  map[string]struct{} // modules that SetModules cannot remove
 	moduleMap  map[string]Module
 	engine     EngineConfig
+	closed     bool
+	timers     []*time.Timer
 }
 
 // NewLinks creates a Links collection for the given node identity.
@@ -819,20 +821,70 @@ func (ls *Links) KickAll() {
 
 // Schedule runs fn after delay under the Links mutex.
 // fn returns a list of peers to kick. Links commits and kicks.
+// The timer is tracked so Close() can cancel it.
 func (ls *Links) Schedule(delay time.Duration, fn func() []string) {
-	time.AfterFunc(delay, func() {
+	var t *time.Timer
+	t = time.AfterFunc(delay, func() {
 		ls.mu.Lock()
+		if ls.closed {
+			ls.mu.Unlock()
+			return
+		}
 		kicks := fn()
 		ls.engine.Commit()
+		ls.removeTimer(t)
 		ls.mu.Unlock()
 		for _, k := range kicks {
 			ls.Kick(k)
 		}
 	})
+	ls.mu.Lock()
+	if ls.closed {
+		t.Stop()
+	} else {
+		ls.timers = append(ls.timers, t)
+	}
+	ls.mu.Unlock()
+}
+
+// removeTimer removes t from the tracked timer list. Caller holds mu.
+func (ls *Links) removeTimer(t *time.Timer) {
+	for i, tt := range ls.timers {
+		if tt == t {
+			ls.timers[i] = ls.timers[len(ls.timers)-1]
+			ls.timers = ls.timers[:len(ls.timers)-1]
+			return
+		}
+	}
+}
+
+// Close stops all scheduled timers and marks the Links as closed.
+// After Close, Schedule callbacks are no-ops and sendPending returns
+// immediately. Must be called when deleting a node to prevent
+// zombie timers from re-persisting the node's state.
+func (ls *Links) Close() {
+	ls.mu.Lock()
+	ls.closed = true
+	for _, t := range ls.timers {
+		t.Stop()
+	}
+	ls.timers = nil
+	// Stop all peer retry timers.
+	for _, lk := range ls.m {
+		if lk.Send != nil && lk.Send.Timer != nil {
+			lk.Send.Timer.Stop()
+			lk.Send = nil
+		}
+	}
+	ls.mu.Unlock()
 }
 
 func (ls *Links) sendPending(peer string) {
 	ls.mu.Lock()
+	if ls.closed {
+		ls.mu.Unlock()
+		return
+	}
 	lk := ls.Get(peer)
 	if lk == nil {
 		ls.mu.Unlock()
@@ -925,6 +977,9 @@ func (ls *Links) sendPending(peer string) {
 
 // setRetry sets a per-peer retry timer. Caller must hold Lock.
 func (ls *Links) setRetry(peer string, counter uint64, refractory bool) {
+	if ls.closed {
+		return
+	}
 	lk := ls.Get(peer)
 	if lk == nil {
 		return
