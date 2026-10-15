@@ -904,7 +904,9 @@ func (ls *Links) sendPending(peer string) {
 	env := SyncRequest{
 		From: ls.self, To: peer, Counter: counter,
 		Method: msg.Method, Payload: msg.Payload,
-		Timestamp: ls.engine.Now(),
+	}
+	if lk.Dominant() {
+		env.Timestamp = ls.engine.Now()
 	}
 	if cr := lk.CachedResponse; cr != nil {
 		env.Resp = cr
