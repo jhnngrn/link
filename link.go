@@ -24,7 +24,14 @@ var (
 	ErrNoLink          = errors.New("no link")
 	ErrMaxLinks        = errors.New("max links")
 	ErrInvitesDisabled = errors.New("invites disabled")
+	ErrTimestamp       = errors.New("timestamp out of range")
 )
+
+// MaxTimestampFuture is the maximum number of seconds a peer's
+// timestamp may be ahead of our local clock.  Generous to tolerate
+// clock drift; the main defence against exploitation is the backward
+// check (peer timestamp must not go below previously stored value).
+const MaxTimestampFuture int64 = 600 // 10 minutes
 
 // ---------------------------------------------------------------------------
 // Link — bilateral sync state
@@ -228,6 +235,23 @@ func (l *Link) ValidateRequest(counter uint64) (*SyncResponse, error) {
 		return nil, ErrCollision
 	}
 	return nil, nil
+}
+
+// ValidateTimestamp checks that ts is within acceptable bounds:
+//   - not before the peer's latest stored timestamp (monotonicity)
+//   - not more than MaxTimestampFuture seconds ahead of now
+func (l *Link) ValidateTimestamp(ts, now int64) error {
+	floor := l.ReqTimestamp
+	if l.RespTimestamp > floor {
+		floor = l.RespTimestamp
+	}
+	if ts < floor {
+		return ErrTimestamp
+	}
+	if ts > now+MaxTimestampFuture {
+		return ErrTimestamp
+	}
+	return nil
 }
 
 // AcceptRequest finalizes an incoming request. Call after the handler
@@ -720,8 +744,14 @@ func (ls *Links) HandleSync(env SyncRequest) (*SyncResponse, error) {
 		lk.State.Status = Incoming
 	}
 
+	now := ls.engine.Now()
+
 	// Piggybacked response.
 	if env.Resp != nil && lk.Pending != nil && env.Resp.Counter == lk.Counter {
+		if err := lk.ValidateTimestamp(env.Resp.Timestamp, now); err != nil {
+			ls.mu.Unlock()
+			return nil, err
+		}
 		pbKicks := ls.dispatchResponse(env.From, lk.Pending.Method, lk.Pending.Payload, env.Resp.OK, env.Resp.Timestamp)
 		lk.AcceptResponse(env.Resp.Timestamp)
 		ls.engine.Commit()
@@ -741,7 +771,13 @@ func (ls *Links) HandleSync(env SyncRequest) (*SyncResponse, error) {
 
 	ts := env.Timestamp
 	if lk.Dominant() {
-		ts = ls.engine.Now()
+		ts = now
+	}
+
+	// Validate peer timestamp (monotonicity + forward cap).
+	if err := lk.ValidateTimestamp(ts, now); err != nil {
+		ls.mu.Unlock()
+		return nil, err
 	}
 
 	// Dispatch to handler.
@@ -857,6 +893,13 @@ func (ls *Links) sendPending(peer string) {
 		if lk != nil {
 			lk.Send = nil
 		}
+		ls.mu.Unlock()
+		return
+	}
+
+	if err := lk.ValidateTimestamp(resp.Timestamp, ls.engine.Now()); err != nil {
+		log.Printf("[link] %s->%s: bad response timestamp: %v", ls.self, peer, err)
+		ls.setRetry(peer, counter, true)
 		ls.mu.Unlock()
 		return
 	}
