@@ -459,6 +459,10 @@ func (l *Link) reqModule(payload json.RawMessage, modules map[string]Module, inv
 		l.State.Modules = map[string]*ConnectionState{}
 	}
 	mod := l.State.Modules[p.Name]
+	// Already connected — idempotent ACK.
+	if mod != nil && mod.Status == Connected {
+		return true, nil
+	}
 	// Mutual — we also want this module.
 	if mod != nil && (mod.IntentConnect || mod.Status == Waiting) {
 		mod.Status = Connected
@@ -682,6 +686,7 @@ func (l *Link) RejectModule(name string) error {
 // QuickReject returns true if this request can be rejected before
 // expensive signature verification (no existing link and not a connect/close).
 func (ls *Links) QuickReject(from, method string) bool {
+	from = strings.ToLower(from)
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
 	return ls.Get(from) == nil && method != "link.connect" && method != "link.close"
@@ -690,6 +695,7 @@ func (ls *Links) QuickReject(from, method string) bool {
 // HandleSync processes an incoming sync request. The caller is responsible
 // for authentication (signature verification).
 func (ls *Links) HandleSync(env SyncRequest) (*SyncResponse, error) {
+	env.From = strings.ToLower(env.From)
 	ls.mu.Lock()
 
 	lk := ls.Get(env.From)
@@ -796,8 +802,8 @@ func (ls *Links) sendPending(peer string) {
 		ls.mu.Unlock()
 		return
 	}
-	if s := lk.Send; s != nil && s.Counter == lk.Counter {
-		if s.InFlight || s.Refractory {
+	if s := lk.Send; s != nil {
+		if s.Counter == lk.Counter && (s.InFlight || s.Refractory) {
 			ls.mu.Unlock()
 			return
 		}
@@ -864,7 +870,7 @@ func (ls *Links) sendPending(peer string) {
 		kickPeer = lk.Pending != nil
 	}
 	ls.engine.Commit()
-	ls.setRetry(peer, counter, false)
+	lk.Send = nil
 	ls.mu.Unlock()
 	if kickPeer {
 		ls.Kick(peer)
@@ -883,16 +889,17 @@ func (ls *Links) setRetry(peer string, counter uint64, refractory bool) {
 	if lk.Send != nil && lk.Send.Timer != nil {
 		lk.Send.Timer.Stop()
 	}
-	lk.Send = &PeerSend{
+	ps := &PeerSend{
 		Counter:    counter,
 		Refractory: refractory,
-		Timer: time.AfterFunc(ls.engine.RetryDelay, func() {
-			ls.mu.Lock()
-			if lk := ls.Get(peer); lk != nil {
-				lk.Send = nil
-			}
-			ls.mu.Unlock()
-			ls.sendPending(peer)
-		}),
 	}
+	ps.Timer = time.AfterFunc(ls.engine.RetryDelay, func() {
+		ls.mu.Lock()
+		if lk := ls.Get(peer); lk != nil && lk.Send == ps {
+			lk.Send = nil
+		}
+		ls.mu.Unlock()
+		ls.sendPending(peer)
+	})
+	lk.Send = ps
 }
