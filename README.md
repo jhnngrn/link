@@ -1,8 +1,6 @@
 # link
 
-Bilateral sync primitive for p2p networks. Zero external dependencies.
-
-Two nodes share a single counter and process one decision at a time. Every message is persisted before it is sent, every response before it is returned. If a node crashes, it picks up where it left off. Two nodes can never disagree about what happened.
+Crash-safe bilateral channel with a shared counter — one decision in flight at a time, so races never arise. Persist before send, persist before respond, retry until delivered. Application modules plug in and write plain request/response logic; link handles ordering, collisions, and crash recovery. Zero external dependencies.
 
 ## What it provides
 
