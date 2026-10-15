@@ -8,7 +8,6 @@ Two nodes share a single counter and process one decision at a time. Every messa
 
 - **Link** — bilateral sync state for one connection: counter, turn bit, pending message, cached response, timestamps
 - **Links** — collection of links with policy, module dispatch, and the full sync loop (incoming, outgoing, retry, scheduling)
-- **ConnectionState** — reusable state machine: Status + IntentConnect/IntentClose + reference counting
 - **Module** — interface for application modules: HandleRequest, HandleResponse, HandleAccount, NextTx
 - **EngineConfig** — callbacks the sync loop needs: Send, Commit, Now
 - **Wire types** — SyncRequest, SyncResponse envelopes
