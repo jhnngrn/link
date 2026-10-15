@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 )
@@ -29,7 +30,7 @@ var (
 // Link — bilateral sync state
 // ---------------------------------------------------------------------------
 
-// LinkStatus — what the link IS.
+// ConnectionStatus — what the link IS.
 type ConnectionStatus string
 
 const (
@@ -161,6 +162,7 @@ type Links struct {
 	self       string
 	InviteMode InviteMode
 	Supported  map[string]struct{}
+	Protected  map[string]struct{} // modules that SetModules cannot remove
 	moduleMap  map[string]Module
 	engine     EngineConfig
 }
@@ -179,7 +181,7 @@ func NewLinks(self string, m map[string]*Link, mode InviteMode, supported map[st
 	if engine.RetryDelay == 0 {
 		engine.RetryDelay = 60 * time.Second
 	}
-	return &Links{m: m, self: self, InviteMode: mode, Supported: supported, moduleMap: map[string]Module{}, engine: engine}
+	return &Links{m: m, self: self, InviteMode: mode, Supported: supported, Protected: map[string]struct{}{}, moduleMap: map[string]Module{}, engine: engine}
 }
 
 // Lock/Unlock expose the mutex for callers that need to hold it
@@ -302,19 +304,10 @@ const MaxLinks = 64
 func enc(v any) json.RawMessage { d, _ := json.Marshal(v); return d }
 
 func splitMethod(method string) (ns, name string) {
-	if i := indexOf(method, '.'); i >= 0 {
+	if i := strings.IndexByte(method, '.'); i >= 0 {
 		return method[:i], method[i+1:]
 	}
 	return "", method
-}
-
-func indexOf(s string, b byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == b {
-			return i
-		}
-	}
-	return -1
 }
 
 // OlderQueuedMsg reports whether a should win over b.
@@ -341,14 +334,39 @@ func OlderQueuedMsg(a, b *QueuedMsg) bool {
 // Link-level request/response handling
 // ---------------------------------------------------------------------------
 
-// HandleRequest dispatches an incoming sync request by namespace.
-// Link-level methods are handled internally; registered modules are
+// dispatchRequest dispatches an incoming sync request by namespace.
+// Link-level methods are handled inline; registered modules are
 // dispatched by name. Returns (ok, kicks, error).
-func (ls *Links) HandleRequest(peer, fullMethod string, payload json.RawMessage, ts int64) (bool, []string, error) {
+func (ls *Links) dispatchRequest(peer, fullMethod string, payload json.RawMessage, ts int64) (bool, []string, error) {
 	ns, method := splitMethod(fullMethod)
 	if ns == "link" {
-		ok, err := ls.handleLinkRequest(peer, method, payload)
-		return ok, nil, err
+		l := ls.Get(peer)
+		if l == nil {
+			return false, nil, fmt.Errorf("no link to %s", peer)
+		}
+		switch method {
+		case "connect":
+			if l.State.IntentConnect || l.State.Status == Waiting {
+				l.State.Status = Connected
+				l.State.IntentConnect = false
+				return true, nil, nil
+			}
+			if ls.InviteMode == InviteModeOpen {
+				l.State.Status = Connected
+				return true, nil, nil
+			}
+			return false, nil, nil
+		case "close":
+			if l.State.Refs > 0 {
+				return false, nil, ErrRefsHeld
+			}
+			ls.Delete(peer)
+			return true, nil, nil
+		case "module":
+			ok, err := l.reqModule(payload, ls.Supported, ls.InviteMode)
+			return ok, nil, err
+		}
+		return false, nil, fmt.Errorf("unknown link method %q", method)
 	}
 	lk := ls.Get(peer)
 	if lk == nil {
@@ -361,44 +379,31 @@ func (ls *Links) HandleRequest(peer, fullMethod string, payload json.RawMessage,
 	return mod.HandleRequest(peer, method, payload, ts)
 }
 
-// handleLinkRequest processes an incoming link-namespace request.
-func (ls *Links) handleLinkRequest(peer, method string, payload json.RawMessage) (bool, error) {
-	l := ls.Get(peer)
-	if l == nil {
-		return false, fmt.Errorf("no link to %s", peer)
-	}
-	switch method {
-	case "connect":
-		if l.State.IntentConnect || l.State.Status == Waiting {
-			l.State.Status = Connected
-			l.State.IntentConnect = false
-			return true, nil
-		}
-		if ls.InviteMode == InviteModeOpen {
-			l.State.Status = Connected
-			return true, nil
-		}
-		return false, nil
-
-	case "close":
-		if l.State.Refs > 0 {
-			return false, ErrRefsHeld
-		}
-		ls.Delete(peer)
-		return true, nil
-
-	case "module":
-		ok, err := l.reqModule(payload, ls.Supported, ls.InviteMode)
-		return ok, err
-	}
-	return false, fmt.Errorf("unknown link method %q", method)
-}
-
-// HandleResponse dispatches a sync response by namespace.
-func (ls *Links) HandleResponse(peer, fullMethod string, payload json.RawMessage, ok bool, ts int64) []string {
+// dispatchResponse dispatches a sync response by namespace.
+func (ls *Links) dispatchResponse(peer, fullMethod string, payload json.RawMessage, ok bool, ts int64) []string {
 	ns, method := splitMethod(fullMethod)
 	if ns == "link" {
-		ls.handleLinkResponse(peer, method, payload, ok)
+		l := ls.Get(peer)
+		if l == nil {
+			return nil
+		}
+		switch method {
+		case "connect":
+			if ok {
+				l.State.Status = Connected
+			} else {
+				l.State.Status = Waiting
+			}
+			l.State.IntentConnect = false
+		case "close":
+			if ok {
+				ls.Delete(peer)
+			} else {
+				l.State.IntentClose = false
+			}
+		case "module":
+			l.respModule(payload, ok)
+		}
 		return nil
 	}
 	mod := ls.moduleMap[ns]
@@ -408,41 +413,29 @@ func (ls *Links) HandleResponse(peer, fullMethod string, payload json.RawMessage
 	return mod.HandleResponse(peer, method, payload, ok, ts)
 }
 
-// handleLinkResponse processes a link-namespace response.
-func (ls *Links) handleLinkResponse(peer, method string, payload json.RawMessage, ok bool) {
-	l := ls.Get(peer)
-	if l == nil {
-		return
-	}
-	switch method {
-	case "connect":
-		if ok {
-			l.State.Status = Connected
-		} else {
-			l.State.Status = Waiting
-		}
-		l.State.IntentConnect = false
-
-	case "close":
-		if ok {
-			ls.Delete(peer)
-		} else {
-			l.State.IntentClose = false
-		}
-
-	case "module":
-		l.respModule(payload, ok)
-	}
-}
-
-// NextTx returns the next message to send on a peer link.
+// nextTx returns the next message to send on a peer link.
 // Link-level messages (connect/close/module) have absolute priority.
 // Among registered modules, the oldest QueuedAt wins.
-func (ls *Links) NextTx(peer string) *QueuedMsg {
+func (ls *Links) nextTx(peer string) *QueuedMsg {
 	// Link-level messages have absolute priority.
-	if msg := ls.linkNextTx(peer); msg != nil {
-		msg.Method = "link." + msg.Method
-		return msg
+	l := ls.Get(peer)
+	if l != nil {
+		if l.State.IntentClose && l.State.Refs == 0 {
+			return &QueuedMsg{Method: "link.close"}
+		}
+		if l.State.IntentConnect {
+			return &QueuedMsg{Method: "link.connect"}
+		}
+		if l.State.Status == Connected {
+			for name, mod := range l.State.Modules {
+				if mod.IntentConnect {
+					return &QueuedMsg{
+						Method:  "link.module",
+						Payload: enc(map[string]string{"name": name}),
+					}
+				}
+			}
+		}
 	}
 	lk := ls.Get(peer)
 	if lk == nil || lk.State.Status != Connected {
@@ -461,31 +454,6 @@ func (ls *Links) NextTx(peer string) *QueuedMsg {
 		}
 	}
 	return best
-}
-
-// linkNextTx returns the next link-level message to send, or nil.
-func (ls *Links) linkNextTx(peer string) *QueuedMsg {
-	l := ls.Get(peer)
-	if l == nil {
-		return nil
-	}
-	if l.State.IntentClose && l.State.Refs == 0 {
-		return &QueuedMsg{Method: "close"}
-	}
-	if l.State.IntentConnect {
-		return &QueuedMsg{Method: "connect"}
-	}
-	if l.State.Status == Connected {
-		for name, mod := range l.State.Modules {
-			if mod.IntentConnect {
-				return &QueuedMsg{
-					Method:  "module",
-					Payload: enc(map[string]string{"name": name}),
-				}
-			}
-		}
-	}
-	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -603,7 +571,7 @@ func (ls *Links) handleLinkAccount(method string, payload json.RawMessage) (json
 		if lk == nil {
 			return nil, nil, fmt.Errorf("no link to %s", p.Peer)
 		}
-		lk.SetModules(p.Modules, ls.Supported)
+		lk.SetModules(p.Modules, ls.Supported, ls.Protected)
 		return enc("ok"), []string{p.Peer}, nil
 
 	case "accept_module":
@@ -661,8 +629,9 @@ func (ls *Links) Status() json.RawMessage {
 }
 
 // SetModules proposes the given modules on this link, filtering by supported.
-// Modules not in the desired set and not yet connected are removed.
-func (l *Link) SetModules(modules []string, supported map[string]struct{}) {
+// Modules not in the desired set and not yet connected are removed,
+// unless they are in the protected set.
+func (l *Link) SetModules(modules []string, supported, protected map[string]struct{}) {
 	if l.State.Modules == nil {
 		l.State.Modules = map[string]*ConnectionState{}
 	}
@@ -681,7 +650,7 @@ func (l *Link) SetModules(modules []string, supported map[string]struct{}) {
 		}
 	}
 	for name, mod := range l.State.Modules {
-		if name == "trustline" {
+		if _, prot := protected[name]; prot {
 			continue
 		}
 		if !desired[name] && mod.Status != Connected {
@@ -751,7 +720,7 @@ func (ls *Links) HandleSync(env SyncRequest) (*SyncResponse, error) {
 
 	// Piggybacked response.
 	if env.Resp != nil && lk.Pending != nil && env.Resp.Counter == lk.Counter {
-		pbKicks := ls.HandleResponse(env.From, lk.Pending.Method, lk.Pending.Payload, env.Resp.OK, env.Resp.Timestamp)
+		pbKicks := ls.dispatchResponse(env.From, lk.Pending.Method, lk.Pending.Payload, env.Resp.OK, env.Resp.Timestamp)
 		lk.AcceptResponse(env.Resp.Timestamp)
 		ls.engine.Commit()
 		for _, k := range pbKicks {
@@ -774,7 +743,7 @@ func (ls *Links) HandleSync(env SyncRequest) (*SyncResponse, error) {
 	}
 
 	// Dispatch to handler.
-	ok, kicks, reqErr := ls.HandleRequest(env.From, env.Method, env.Payload, ts)
+	ok, kicks, reqErr := ls.dispatchRequest(env.From, env.Method, env.Payload, ts)
 	if reqErr != nil {
 		ls.mu.Unlock()
 		return nil, reqErr
@@ -843,7 +812,7 @@ func (ls *Links) sendPending(peer string) {
 	}
 	promoted := false
 	if lk.Pending == nil {
-		lk.Pending = ls.NextTx(peer)
+		lk.Pending = ls.nextTx(peer)
 		if lk.Pending == nil {
 			ls.mu.Unlock()
 			return
@@ -890,12 +859,12 @@ func (ls *Links) sendPending(peer string) {
 		return
 	}
 
-	extraKicks := ls.HandleResponse(peer, msg.Method, msg.Payload, resp.OK, resp.Timestamp)
+	extraKicks := ls.dispatchResponse(peer, msg.Method, msg.Payload, resp.OK, resp.Timestamp)
 	lk.AcceptResponse(resp.Timestamp)
 
 	var kickPeer bool
 	if ls.Get(peer) != nil {
-		lk.Pending = ls.NextTx(peer)
+		lk.Pending = ls.nextTx(peer)
 		kickPeer = lk.Pending != nil
 	}
 	ls.engine.Commit()
