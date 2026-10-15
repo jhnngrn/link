@@ -123,8 +123,7 @@ type Link struct {
 	TurnBit        uint64        `json:"turn_bit"`
 	Pending        *QueuedMsg    `json:"pending,omitempty"`
 	CachedResponse *SyncResponse `json:"cached_response,omitempty"`
-	ReqTimestamp   int64         `json:"req_ts"`
-	RespTimestamp  int64         `json:"resp_ts"`
+	Timestamp      int64         `json:"ts"`
 	Send           *PeerSend     `json:"-"`
 }
 
@@ -240,14 +239,10 @@ func (l *Link) ValidateRequest(counter uint64) (*SyncResponse, error) {
 }
 
 // ValidateTimestamp checks that ts is within acceptable bounds:
-//   - not before the peer's latest stored timestamp (monotonicity)
+//   - not before the link's latest timestamp (monotonicity)
 //   - not more than MaxTimestampFuture seconds ahead of now
 func (l *Link) ValidateTimestamp(ts, now int64) error {
-	floor := l.ReqTimestamp
-	if l.RespTimestamp > floor {
-		floor = l.RespTimestamp
-	}
-	if ts < floor {
+	if ts < l.Timestamp {
 		return ErrTimestamp
 	}
 	if ts > now+MaxTimestampFuture {
@@ -262,7 +257,7 @@ func (l *Link) AcceptRequest(reqCounter uint64, ok bool, ts int64) *SyncResponse
 	resp := SyncResponse{Counter: reqCounter, OK: ok, Timestamp: ts}
 	l.CachedResponse = &resp
 	l.Counter++
-	l.ReqTimestamp = ts
+	l.Timestamp = ts
 	l.Pending = nil
 	return &resp
 }
@@ -271,7 +266,7 @@ func (l *Link) AcceptRequest(reqCounter uint64, ok bool, ts int64) *SyncResponse
 // Call after the response handler has processed the response.
 func (l *Link) AcceptResponse(ts int64) {
 	l.Counter++
-	l.RespTimestamp = ts
+	l.Timestamp = ts
 	l.Pending = nil
 }
 
@@ -776,6 +771,9 @@ func (ls *Links) HandleSync(env SyncRequest) (*SyncResponse, error) {
 	ts := env.Timestamp
 	if lk.Dominant() {
 		ts = now
+		if ts < lk.Timestamp {
+			ts = lk.Timestamp
+		}
 	}
 
 	// Validate peer timestamp (monotonicity + forward cap).
@@ -907,6 +905,9 @@ func (ls *Links) sendPending(peer string) {
 	}
 	if lk.Dominant() {
 		env.Timestamp = ls.engine.Now()
+		if env.Timestamp < lk.Timestamp {
+			env.Timestamp = lk.Timestamp
+		}
 	}
 	if cr := lk.CachedResponse; cr != nil {
 		env.Resp = cr
