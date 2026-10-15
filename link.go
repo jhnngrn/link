@@ -104,7 +104,7 @@ type QueuedMsg struct {
 }
 
 // PeerSend tracks the outgoing send lifecycle for a link at a given counter.
-// InFlight means a goroutine is blocked on Transport.Send.
+// InFlight means a goroutine is blocked on Send.
 // After the send completes, a retry timer is set: Refractory after error
 // (blocks kicks), non-refractory after success (fallback, kicks bypass).
 // Both are scoped to Counter — if counter advances via HandleSync,
