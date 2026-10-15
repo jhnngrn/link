@@ -55,9 +55,31 @@ The sync protocol guarantees:
 
 ### Modules
 
-A module is anything that implements the `Module` interface. Links calls `NextTx(peer)` to pull the next outgoing message — it returns a method, payload, and TTL, or false if there's nothing to send. The module decides internally what to send next: a queue, a state machine, a database query, whatever fits. Links doesn't care. It just calls `NextTx`, sends what it gets, and delivers the response back via `HandleResponse`. Incoming requests arrive through `HandleRequest`.
+A module is anything that implements the `Module` interface:
 
-Payloads are `json.RawMessage` — validated but unparsed JSON. The link layer never inspects them; modules parse what they need on their end.
+```go
+type Module interface {
+    Name() string
+
+    // Incoming request from peer. Return (ok, kicks, err).
+    // ok=true accepts, ok=false NACKs. kicks lists peers to send to next.
+    HandleRequest(peer, method string, payload json.RawMessage, ts int64) (bool, []string, error)
+
+    // Response to our outgoing request. ok reflects the peer's accept/reject.
+    // Return kicks.
+    HandleResponse(peer, method string, payload json.RawMessage, ok bool, ts int64) []string
+
+    // Admin/account operation (not sync). Return (response, kicks, err).
+    HandleAccount(method string, payload json.RawMessage) (json.RawMessage, []string, error)
+
+    // Pull next outgoing message for peer: (method, payload, ttl).
+    // Empty method means nothing to send. Links polls this — the module
+    // decides internally what's next: a queue, a state machine, whatever fits.
+    NextTx(peer string) (string, json.RawMessage, int64)
+}
+```
+
+Payloads are `json.RawMessage` — validated but unparsed JSON. The link layer never inspects them; modules parse what they need on their end. Modules don't persist — Links calls `Commit` after every state change.
 
 ### Timestamps
 
