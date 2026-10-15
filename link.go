@@ -522,22 +522,33 @@ func (l *Link) respModule(payload json.RawMessage, ok bool) {
 // ---------------------------------------------------------------------------
 
 // HandleAccount dispatches an account API call by namespace.
-// Caller must hold Lock. Returns (result, error).
-// Kicks are handled internally.
+// Handles locking, commit, and kicks internally — like HandleSync.
 func (ls *Links) HandleAccount(fullMethod string, payload json.RawMessage) (json.RawMessage, error) {
+	ls.mu.Lock()
 	ns, method := splitMethod(fullMethod)
+
+	var result json.RawMessage
+	var kicks []string
+	var err error
+
 	if ns == "link" {
-		result, kicks, err := ls.handleLinkAccount(method, payload)
-		for _, k := range kicks {
-			ls.Kick(k)
+		result, kicks, err = ls.handleLinkAccount(method, payload)
+	} else {
+		mod := ls.moduleMap[ns]
+		if mod == nil {
+			ls.mu.Unlock()
+			return nil, fmt.Errorf("unknown method %q", fullMethod)
 		}
-		return result, err
+		result, err = mod.HandleAccount(method, payload)
 	}
-	mod := ls.moduleMap[ns]
-	if mod == nil {
-		return nil, fmt.Errorf("unknown method %q", fullMethod)
+
+	if err == nil {
+		ls.engine.Commit()
 	}
-	result, err := mod.HandleAccount(method, payload)
+	ls.mu.Unlock()
+	for _, k := range kicks {
+		ls.Kick(k)
+	}
 	return result, err
 }
 

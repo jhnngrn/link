@@ -35,11 +35,8 @@ ls.RegisterModule(myModule)
 // Incoming sync — Links handles locking, dispatch, persistence, kicks
 resp, err := ls.HandleSync(env)
 
-// Account API — Links dispatches, commits, and kicks internally
-ls.Lock()
+// Account API — Links handles locking, commit, and kicks internally
 result, err := ls.HandleAccount("set_modules", payload)
-if err == nil { ls.Commit() }
-ls.Unlock()
 
 // Resume pending sends at boot
 ls.KickAll()
