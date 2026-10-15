@@ -161,27 +161,23 @@ type Links struct {
 	m          map[string]*Link
 	self       string
 	InviteMode InviteMode
-	Supported  map[string]struct{}
 	Protected  map[string]struct{} // modules that SetModules cannot remove
 	moduleMap  map[string]Module
 	engine     EngineConfig
 }
 
 // NewLinks creates a Links collection for the given node identity.
-func NewLinks(self string, m map[string]*Link, mode InviteMode, supported map[string]struct{}, engine EngineConfig) *Links {
+func NewLinks(self string, m map[string]*Link, mode InviteMode, engine EngineConfig) *Links {
 	if m == nil {
 		m = map[string]*Link{}
 	}
 	if mode == "" {
 		mode = InviteModeInvite
 	}
-	if supported == nil {
-		supported = map[string]struct{}{}
-	}
 	if engine.RetryDelay == 0 {
 		engine.RetryDelay = 60 * time.Second
 	}
-	return &Links{m: m, self: self, InviteMode: mode, Supported: supported, Protected: map[string]struct{}{}, moduleMap: map[string]Module{}, engine: engine}
+	return &Links{m: m, self: self, InviteMode: mode, Protected: map[string]struct{}{}, moduleMap: map[string]Module{}, engine: engine}
 }
 
 // Lock/Unlock expose the mutex for callers that need to hold it
@@ -196,11 +192,8 @@ func (ls *Links) Commit() { ls.engine.Commit() }
 func (ls *Links) Self() string { return ls.self }
 
 // RegisterModule adds a module to the link collection.
-// Its name is added to Supported so module negotiation includes it.
 func (ls *Links) RegisterModule(m Module) {
-	name := m.Name()
-	ls.moduleMap[name] = m
-	ls.Supported[name] = struct{}{}
+	ls.moduleMap[m.Name()] = m
 }
 
 // ModuleMap returns the registered modules for serialization.
@@ -363,7 +356,7 @@ func (ls *Links) dispatchRequest(peer, fullMethod string, payload json.RawMessag
 			ls.Delete(peer)
 			return true, nil, nil
 		case "module":
-			ok, err := l.reqModule(payload, ls.Supported, ls.InviteMode)
+			ok, err := l.reqModule(payload, ls.moduleMap, ls.InviteMode)
 			return ok, nil, err
 		}
 		return false, nil, fmt.Errorf("unknown link method %q", method)
@@ -460,14 +453,14 @@ func (ls *Links) nextTx(peer string) *QueuedMsg {
 // Module negotiation (internal)
 // ---------------------------------------------------------------------------
 
-func (l *Link) reqModule(payload json.RawMessage, supported map[string]struct{}, inviteMode InviteMode) (bool, error) {
+func (l *Link) reqModule(payload json.RawMessage, modules map[string]Module, inviteMode InviteMode) (bool, error) {
 	var p struct {
 		Name string `json:"name"`
 	}
 	if json.Unmarshal(payload, &p) != nil || p.Name == "" {
 		return false, fmt.Errorf("bad payload")
 	}
-	if _, ok := supported[p.Name]; !ok {
+	if _, ok := modules[p.Name]; !ok {
 		return false, nil // we don't speak this module
 	}
 	if l.State.Modules == nil {
@@ -582,7 +575,7 @@ func (ls *Links) handleLinkAccount(method string, payload json.RawMessage) (json
 		if lk == nil {
 			return nil, nil, fmt.Errorf("no link to %s", p.Peer)
 		}
-		lk.SetModules(p.Modules, ls.Supported, ls.Protected)
+		lk.SetModules(p.Modules, ls.moduleMap, ls.Protected)
 		return enc("ok"), []string{p.Peer}, nil
 
 	case "accept_module":
@@ -642,13 +635,13 @@ func (ls *Links) Status() json.RawMessage {
 // SetModules proposes the given modules on this link, filtering by supported.
 // Modules not in the desired set and not yet connected are removed,
 // unless they are in the protected set.
-func (l *Link) SetModules(modules []string, supported, protected map[string]struct{}) {
+func (l *Link) SetModules(modules []string, registered map[string]Module, protected map[string]struct{}) {
 	if l.State.Modules == nil {
 		l.State.Modules = map[string]*ConnectionState{}
 	}
 	desired := map[string]bool{}
 	for _, name := range modules {
-		if _, ok := supported[name]; ok {
+		if _, ok := registered[name]; ok {
 			desired[name] = true
 		}
 	}

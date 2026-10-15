@@ -27,7 +27,7 @@ engine := link.EngineConfig{
 }
 
 // Create a collection for node "alice"
-ls := link.NewLinks("alice", nil, link.InviteModeInvite, supported, engine)
+ls := link.NewLinks("alice", nil, link.InviteModeInvite, engine)
 
 // Register application modules
 ls.RegisterModule(myModule)
