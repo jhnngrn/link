@@ -1,23 +1,28 @@
-// Package link defines the bilateral sync primitive — the data structures
-// and protocol types for a single link between two parties.
+// Package link defines the bilateral sync primitive — the data structures,
+// protocol types and sync loop for bilateral links between parties.
 package link
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"sync"
 	"time"
 )
 
 // ---------------------------------------------------------------------------
-// Errors — link-level protocol errors
+// Errors — protocol-level errors
 // ---------------------------------------------------------------------------
 
 var (
-	ErrStaleCounter = errors.New("stale counter")
-	ErrCounterAhead = errors.New("counter ahead")
-	ErrCollision    = errors.New("collision")
-	ErrRefsHeld     = errors.New("close with refs > 0")
+	ErrStaleCounter    = errors.New("stale counter")
+	ErrCounterAhead    = errors.New("counter ahead")
+	ErrCollision       = errors.New("collision")
+	ErrRefsHeld        = errors.New("close with refs > 0")
+	ErrNoLink          = errors.New("no link")
+	ErrMaxLinks        = errors.New("max links")
+	ErrInvitesDisabled = errors.New("invites disabled")
 )
 
 // ---------------------------------------------------------------------------
@@ -134,20 +139,34 @@ func NewLink(self, peer string) *Link {
 }
 
 // ---------------------------------------------------------------------------
-// Links — collection of links for a node
+// Links — collection of links for a node, including the sync loop
 // ---------------------------------------------------------------------------
+
+// EngineConfig provides the callbacks Links needs to run the sync loop.
+type EngineConfig struct {
+	// Send delivers a sync message to a peer and returns the response body.
+	Send func(peer string, msg SyncRequest) ([]byte, error)
+	// Commit persists the current state. Called under the mutex.
+	Commit func()
+	// Now returns the current time as unix seconds.
+	Now func() int64
+	// RetryDelay is the delay between retry attempts.
+	RetryDelay time.Duration
+}
 
 // Links manages the set of bilateral links for a node.
 type Links struct {
+	mu         sync.Mutex
 	m          map[string]*Link
 	self       string
 	InviteMode InviteMode
 	Supported  map[string]struct{}
 	moduleMap  map[string]Module
+	engine     EngineConfig
 }
 
 // NewLinks creates a Links collection for the given node identity.
-func NewLinks(self string, m map[string]*Link, mode InviteMode, supported map[string]struct{}) *Links {
+func NewLinks(self string, m map[string]*Link, mode InviteMode, supported map[string]struct{}, engine EngineConfig) *Links {
 	if m == nil {
 		m = map[string]*Link{}
 	}
@@ -157,8 +176,22 @@ func NewLinks(self string, m map[string]*Link, mode InviteMode, supported map[st
 	if supported == nil {
 		supported = map[string]struct{}{}
 	}
-	return &Links{m: m, self: self, InviteMode: mode, Supported: supported, moduleMap: map[string]Module{}}
+	if engine.RetryDelay == 0 {
+		engine.RetryDelay = 60 * time.Second
+	}
+	return &Links{m: m, self: self, InviteMode: mode, Supported: supported, moduleMap: map[string]Module{}, engine: engine}
 }
+
+// Lock/Unlock expose the mutex for callers that need to hold it
+// across multiple operations (e.g. HandleAccount + Commit).
+func (ls *Links) Lock()   { ls.mu.Lock() }
+func (ls *Links) Unlock() { ls.mu.Unlock() }
+
+// Commit persists the current state via the engine callback. Caller must hold Lock.
+func (ls *Links) Commit() { ls.engine.Commit() }
+
+// Self returns the node identity.
+func (ls *Links) Self() string { return ls.self }
 
 // RegisterModule adds a module to the link collection.
 // Its name is added to Supported so module negotiation includes it.
@@ -185,7 +218,7 @@ func (ls *Links) Create(peer string) *Link {
 }
 
 // ---------------------------------------------------------------------------
-// Sync lifecycle
+// Sync lifecycle — request/response validation
 // ---------------------------------------------------------------------------
 
 // ValidateRequest checks whether an incoming request at the given counter
@@ -521,18 +554,23 @@ func (l *Link) respModule(payload json.RawMessage, ok bool) {
 // ---------------------------------------------------------------------------
 
 // HandleAccount dispatches an account API call by namespace.
-// Returns (result, peersToKick, error).
-func (ls *Links) HandleAccount(fullMethod string, payload json.RawMessage) (json.RawMessage, []string, error) {
+// Caller must hold Lock. Returns (result, error).
+// Kicks are handled internally.
+func (ls *Links) HandleAccount(fullMethod string, payload json.RawMessage) (json.RawMessage, error) {
 	ns, method := splitMethod(fullMethod)
 	if ns == "link" {
-		return ls.handleLinkAccount(method, payload)
+		result, kicks, err := ls.handleLinkAccount(method, payload)
+		for _, k := range kicks {
+			ls.Kick(k)
+		}
+		return result, err
 	}
 	mod := ls.moduleMap[ns]
 	if mod == nil {
-		return nil, nil, fmt.Errorf("unknown method %q", fullMethod)
+		return nil, fmt.Errorf("unknown method %q", fullMethod)
 	}
 	result, err := mod.HandleAccount(method, payload)
-	return result, nil, err
+	return result, err
 }
 
 // handleLinkAccount processes a link-namespace account operation.
@@ -670,4 +708,226 @@ func (l *Link) RejectModule(name string) error {
 	}
 	delete(l.State.Modules, name)
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Sync loop — incoming
+// ---------------------------------------------------------------------------
+
+// QuickReject returns true if this request can be rejected before
+// expensive signature verification (no existing link and not a connect/close).
+func (ls *Links) QuickReject(from, method string) bool {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	return ls.Get(from) == nil && method != "link.connect" && method != "link.close"
+}
+
+// HandleSync processes an incoming sync request. The caller is responsible
+// for authentication (signature verification).
+func (ls *Links) HandleSync(env SyncRequest) (*SyncResponse, error) {
+	ls.mu.Lock()
+
+	lk := ls.Get(env.From)
+	if lk == nil {
+		if env.Method == "link.close" {
+			ls.mu.Unlock()
+			return &SyncResponse{Counter: env.Counter, OK: true, Timestamp: ls.engine.Now()}, nil
+		}
+		if env.Method != "link.connect" {
+			ls.mu.Unlock()
+			return nil, ErrNoLink
+		}
+		if ls.InviteMode == InviteModeClosed {
+			ls.mu.Unlock()
+			return nil, ErrInvitesDisabled
+		}
+		if ls.Full() {
+			ls.mu.Unlock()
+			return nil, ErrMaxLinks
+		}
+		lk = ls.Create(env.From)
+		lk.State.Status = Incoming
+	}
+
+	// Piggybacked response.
+	if env.Resp != nil && lk.Pending != nil && env.Resp.Counter == lk.Counter {
+		pbKicks := ls.HandleResponse(env.From, lk.Pending.Method, lk.Pending.Payload, env.Resp.OK, env.Resp.Timestamp)
+		lk.AcceptResponse(env.Resp.Timestamp)
+		ls.engine.Commit()
+		for _, k := range pbKicks {
+			ls.Kick(k)
+		}
+	}
+
+	// Validate counter and collision.
+	if cached, err := lk.ValidateRequest(env.Counter); err != nil {
+		ls.mu.Unlock()
+		return nil, err
+	} else if cached != nil {
+		ls.mu.Unlock()
+		return cached, nil
+	}
+
+	ts := env.Timestamp
+	if lk.Dominant() {
+		ts = ls.engine.Now()
+	}
+
+	// Dispatch to handler.
+	ok, kicks, reqErr := ls.HandleRequest(env.From, env.Method, env.Payload, ts)
+	if reqErr != nil {
+		ls.mu.Unlock()
+		return nil, reqErr
+	}
+
+	resp := lk.AcceptRequest(env.Counter, ok, ts)
+	ls.engine.Commit()
+	ls.mu.Unlock()
+	ls.Kick(env.From)
+	for _, k := range kicks {
+		ls.Kick(k)
+	}
+	return resp, nil
+}
+
+// ---------------------------------------------------------------------------
+// Sync loop — outgoing
+// ---------------------------------------------------------------------------
+
+// Kick triggers a sendPending for the given peer.
+func (ls *Links) Kick(peer string) { go ls.sendPending(peer) }
+
+// KickAll kicks all peers. Used at boot to resume pending work.
+func (ls *Links) KickAll() {
+	ls.mu.Lock()
+	peers := make([]string, 0, ls.Len())
+	for peer := range ls.m {
+		peers = append(peers, peer)
+	}
+	ls.mu.Unlock()
+	for _, p := range peers {
+		ls.Kick(p)
+	}
+}
+
+// Schedule runs fn after delay under the Links mutex.
+// fn returns a list of peers to kick. Links commits and kicks.
+func (ls *Links) Schedule(delay time.Duration, fn func() []string) {
+	time.AfterFunc(delay, func() {
+		ls.mu.Lock()
+		kicks := fn()
+		ls.engine.Commit()
+		ls.mu.Unlock()
+		for _, k := range kicks {
+			ls.Kick(k)
+		}
+	})
+}
+
+func (ls *Links) sendPending(peer string) {
+	ls.mu.Lock()
+	lk := ls.Get(peer)
+	if lk == nil {
+		ls.mu.Unlock()
+		return
+	}
+	if s := lk.Send; s != nil && s.Counter == lk.Counter {
+		if s.InFlight || s.Refractory {
+			ls.mu.Unlock()
+			return
+		}
+		if s.Timer != nil {
+			s.Timer.Stop()
+		}
+		lk.Send = nil
+	}
+	promoted := false
+	if lk.Pending == nil {
+		lk.Pending = ls.NextTx(peer)
+		if lk.Pending == nil {
+			ls.mu.Unlock()
+			return
+		}
+		promoted = true
+	}
+	counter := lk.Counter
+	lk.Send = &PeerSend{Counter: counter, InFlight: true}
+	msg := lk.Pending
+	env := SyncRequest{
+		From: ls.self, To: peer, Counter: counter,
+		Method: msg.Method, Payload: msg.Payload,
+		Timestamp: ls.engine.Now(),
+	}
+	if cr := lk.CachedResponse; cr != nil {
+		env.Resp = cr
+	}
+	if promoted {
+		ls.engine.Commit()
+	}
+	ls.mu.Unlock()
+
+	body, err := ls.engine.Send(peer, env)
+
+	ls.mu.Lock()
+	if err != nil {
+		log.Printf("[link] %s->%s %s: %v", ls.self, peer, msg.Method, err)
+		ls.setRetry(peer, counter, true)
+		ls.mu.Unlock()
+		return
+	}
+	var resp SyncResponse
+	if json.Unmarshal(body, &resp) != nil {
+		ls.setRetry(peer, counter, true)
+		ls.mu.Unlock()
+		return
+	}
+	lk = ls.Get(peer)
+	if lk == nil || lk.Pending != msg || lk.Counter != counter || resp.Counter != counter {
+		if lk != nil {
+			lk.Send = nil
+		}
+		ls.mu.Unlock()
+		return
+	}
+
+	extraKicks := ls.HandleResponse(peer, msg.Method, msg.Payload, resp.OK, resp.Timestamp)
+	lk.AcceptResponse(resp.Timestamp)
+
+	var kickPeer bool
+	if ls.Get(peer) != nil {
+		lk.Pending = ls.NextTx(peer)
+		kickPeer = lk.Pending != nil
+	}
+	ls.engine.Commit()
+	ls.setRetry(peer, counter, false)
+	ls.mu.Unlock()
+	if kickPeer {
+		ls.Kick(peer)
+	}
+	for _, k := range extraKicks {
+		ls.Kick(k)
+	}
+}
+
+// setRetry sets a per-peer retry timer. Caller must hold Lock.
+func (ls *Links) setRetry(peer string, counter uint64, refractory bool) {
+	lk := ls.Get(peer)
+	if lk == nil {
+		return
+	}
+	if lk.Send != nil && lk.Send.Timer != nil {
+		lk.Send.Timer.Stop()
+	}
+	lk.Send = &PeerSend{
+		Counter:    counter,
+		Refractory: refractory,
+		Timer: time.AfterFunc(ls.engine.RetryDelay, func() {
+			ls.mu.Lock()
+			if lk := ls.Get(peer); lk != nil {
+				lk.Send = nil
+			}
+			ls.mu.Unlock()
+			ls.sendPending(peer)
+		}),
+	}
 }
