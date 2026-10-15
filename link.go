@@ -88,7 +88,7 @@ type Module interface {
 	Name() string
 	HandleRequest(peer, method string, payload json.RawMessage, ts int64) (bool, []string, error)
 	HandleResponse(peer, method string, payload json.RawMessage, ok bool, ts int64) []string
-	HandleAccount(method string, payload json.RawMessage) (json.RawMessage, error)
+	HandleAccount(method string, payload json.RawMessage) (json.RawMessage, []string, error)
 	NextTx(peer string) *QueuedMsg
 }
 
@@ -554,7 +554,9 @@ func (ls *Links) HandleAccount(fullMethod string, payload json.RawMessage) (json
 			ls.mu.Unlock()
 			return nil, fmt.Errorf("unknown method %q", fullMethod)
 		}
-		result, err = mod.HandleAccount(method, payload)
+		var modKicks []string
+		result, modKicks, err = mod.HandleAccount(method, payload)
+		kicks = append(kicks, modKicks...)
 	}
 
 	if err == nil {
