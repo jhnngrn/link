@@ -180,14 +180,6 @@ func NewLinks(self string, m map[string]*Link, mode InviteMode, engine EngineCon
 	return &Links{m: m, self: self, InviteMode: mode, Protected: map[string]struct{}{}, moduleMap: map[string]Module{}, engine: engine}
 }
 
-// Lock/Unlock expose the mutex for callers that need to hold it
-// across multiple operations (e.g. HandleAccount + Commit).
-func (ls *Links) Lock()   { ls.mu.Lock() }
-func (ls *Links) Unlock() { ls.mu.Unlock() }
-
-// Commit persists the current state via the engine callback. Caller must hold Lock.
-func (ls *Links) Commit() { ls.engine.Commit() }
-
 // Self returns the node identity.
 func (ls *Links) Self() string { return ls.self }
 
