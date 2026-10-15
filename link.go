@@ -170,9 +170,9 @@ type Links struct {
 	InviteMode InviteMode
 	Protected  map[string]struct{} // modules that SetModules cannot remove
 	moduleMap  map[string]Module
-	engine     EngineConfig
-	closed     bool
-	timers     []*time.Timer
+	engine  EngineConfig
+	timers  []*time.Timer
+	stopped bool
 }
 
 // NewLinks creates a Links collection for the given node identity.
@@ -821,55 +821,42 @@ func (ls *Links) KickAll() {
 
 // Schedule runs fn after delay under the Links mutex.
 // fn returns a list of peers to kick. Links commits and kicks.
-// The timer is tracked so Close() can cancel it.
+// The timer is tracked so Stop() can cancel it.
+//
+// Schedule is called from two contexts: during init (no mutex held)
+// and from within a callback (mutex held). The timer append is safe
+// in both cases — init has no concurrency, callbacks hold the mutex.
 func (ls *Links) Schedule(delay time.Duration, fn func() []string) {
 	var t *time.Timer
 	t = time.AfterFunc(delay, func() {
 		ls.mu.Lock()
-		if ls.closed {
+		if ls.stopped {
 			ls.mu.Unlock()
 			return
 		}
 		kicks := fn()
 		ls.engine.Commit()
-		ls.removeTimer(t)
 		ls.mu.Unlock()
 		for _, k := range kicks {
 			ls.Kick(k)
 		}
 	})
-	ls.mu.Lock()
-	if ls.closed {
-		t.Stop()
-	} else {
-		ls.timers = append(ls.timers, t)
-	}
-	ls.mu.Unlock()
+	// No mutex lock here — called under mutex (callback) or during
+	// init (no concurrency). Locking would deadlock in the callback case.
+	ls.timers = append(ls.timers, t)
 }
 
-// removeTimer removes t from the tracked timer list. Caller holds mu.
-func (ls *Links) removeTimer(t *time.Timer) {
-	for i, tt := range ls.timers {
-		if tt == t {
-			ls.timers[i] = ls.timers[len(ls.timers)-1]
-			ls.timers = ls.timers[:len(ls.timers)-1]
-			return
-		}
-	}
-}
-
-// Close stops all scheduled timers and marks the Links as closed.
-// After Close, Schedule callbacks are no-ops and sendPending returns
-// immediately. Must be called when deleting a node to prevent
-// zombie timers from re-persisting the node's state.
-func (ls *Links) Close() {
+// Stop cancels all scheduled and retry timers and marks the Links as
+// stopped. After Stop, Schedule callbacks and sendPending are no-ops.
+// Must be called when deleting a node to prevent zombie timers from
+// re-persisting the node's state.
+func (ls *Links) Stop() {
 	ls.mu.Lock()
-	ls.closed = true
+	ls.stopped = true
 	for _, t := range ls.timers {
 		t.Stop()
 	}
 	ls.timers = nil
-	// Stop all peer retry timers.
 	for _, lk := range ls.m {
 		if lk.Send != nil && lk.Send.Timer != nil {
 			lk.Send.Timer.Stop()
@@ -881,7 +868,7 @@ func (ls *Links) Close() {
 
 func (ls *Links) sendPending(peer string) {
 	ls.mu.Lock()
-	if ls.closed {
+	if ls.stopped {
 		ls.mu.Unlock()
 		return
 	}
@@ -977,7 +964,7 @@ func (ls *Links) sendPending(peer string) {
 
 // setRetry sets a per-peer retry timer. Caller must hold Lock.
 func (ls *Links) setRetry(peer string, counter uint64, refractory bool) {
-	if ls.closed {
+	if ls.stopped {
 		return
 	}
 	lk := ls.Get(peer)
