@@ -53,6 +53,20 @@ The sync protocol guarantees:
 - **Collision-free** — turn bit determines dominance, alternates each counter
 - **Guaranteed delivery** — sender retries until response received
 
+### Modules
+
+A module is anything that implements the `Module` interface. Links calls `NextTx(peer)` to pull the next outgoing message — it returns a method, payload, and TTL, or false if there's nothing to send. The module decides internally what to send next: a queue, a state machine, a database query, whatever fits. Links doesn't care. It just calls `NextTx`, sends what it gets, and delivers the response back via `HandleResponse`. Incoming requests arrive through `HandleRequest`.
+
+Payloads are `json.RawMessage` — validated but unparsed JSON. The link layer never inspects them; modules parse what they need on their end.
+
+### Timestamps
+
+The dominant peer (determined by `counter % 2 == turnBit`) sets the authoritative timestamp. Non-dominant senders omit the timestamp; the dominant receiver substitutes its own clock. If the dominant clock is behind the floor (set by the previous dominant peer), it clamps to `max(now, floor)`. Timestamps are validated for monotonicity and a forward cap of 10 minutes.
+
+### Concurrency
+
+Links wraps its state in a `sync.Mutex`. Kick spawns a goroutine for each send attempt. Retry timers use a generation counter — replacing a PeerSend increments the generation, and the timer goroutine checks whether its generation is still current before acting.
+
 ## Connection lifecycle
 
 ```
