@@ -143,6 +143,7 @@ type Links struct {
 	self       string
 	InviteMode InviteMode
 	Supported  map[string]struct{}
+	moduleMap  map[string]Module
 }
 
 // NewLinks creates a Links collection for the given node identity.
@@ -156,8 +157,19 @@ func NewLinks(self string, m map[string]*Link, mode InviteMode, supported map[st
 	if supported == nil {
 		supported = map[string]struct{}{}
 	}
-	return &Links{m: m, self: self, InviteMode: mode, Supported: supported}
+	return &Links{m: m, self: self, InviteMode: mode, Supported: supported, moduleMap: map[string]Module{}}
 }
+
+// RegisterModule adds a module to the link collection.
+// Its name is added to Supported so module negotiation includes it.
+func (ls *Links) RegisterModule(m Module) {
+	name := m.Name()
+	ls.moduleMap[name] = m
+	ls.Supported[name] = struct{}{}
+}
+
+// ModuleMap returns the registered modules for serialization.
+func (ls *Links) ModuleMap() map[string]Module { return ls.moduleMap }
 
 func (ls *Links) Get(peer string) *Link { return ls.m[peer] }
 func (ls *Links) Len() int              { return len(ls.m) }
@@ -256,14 +268,68 @@ const MaxLinks = 64
 
 func enc(v any) json.RawMessage { d, _ := json.Marshal(v); return d }
 
+func splitMethod(method string) (ns, name string) {
+	if i := indexOf(method, '.'); i >= 0 {
+		return method[:i], method[i+1:]
+	}
+	return "", method
+}
+
+func indexOf(s string, b byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == b {
+			return i
+		}
+	}
+	return -1
+}
+
+// OlderQueuedMsg reports whether a should win over b.
+// Zero QueuedAt means unset — unset loses to any set value.
+// Equal values (including both zero) return false, preserving
+// the earlier candidate.
+func OlderQueuedMsg(a, b *QueuedMsg) bool {
+	if b == nil {
+		return true
+	}
+	if a.QueuedAt == 0 && b.QueuedAt == 0 {
+		return false
+	}
+	if a.QueuedAt == 0 {
+		return false
+	}
+	if b.QueuedAt == 0 {
+		return true
+	}
+	return a.QueuedAt < b.QueuedAt
+}
+
 // ---------------------------------------------------------------------------
 // Link-level request/response handling
 // ---------------------------------------------------------------------------
 
-// HandleRequest processes an incoming link-namespace request.
-// Returns (ok, deleteLink, error). When deleteLink is true the caller
-// must remove the link and notify modules.
-func (ls *Links) HandleRequest(peer, method string, payload json.RawMessage) (bool, error) {
+// HandleRequest dispatches an incoming sync request by namespace.
+// Link-level methods are handled internally; registered modules are
+// dispatched by name. Returns (ok, kicks, error).
+func (ls *Links) HandleRequest(peer, fullMethod string, payload json.RawMessage, ts int64) (bool, []string, error) {
+	ns, method := splitMethod(fullMethod)
+	if ns == "link" {
+		ok, err := ls.handleLinkRequest(peer, method, payload)
+		return ok, nil, err
+	}
+	lk := ls.Get(peer)
+	if lk == nil {
+		return false, nil, fmt.Errorf("no link to %s", peer)
+	}
+	mod := ls.moduleMap[ns]
+	if mod == nil || !lk.ModuleEnabled(ns) {
+		return false, nil, fmt.Errorf("unknown method %q", fullMethod)
+	}
+	return mod.HandleRequest(peer, method, payload, ts)
+}
+
+// handleLinkRequest processes an incoming link-namespace request.
+func (ls *Links) handleLinkRequest(peer, method string, payload json.RawMessage) (bool, error) {
 	l := ls.Get(peer)
 	if l == nil {
 		return false, fmt.Errorf("no link to %s", peer)
@@ -295,8 +361,22 @@ func (ls *Links) HandleRequest(peer, method string, payload json.RawMessage) (bo
 	return false, fmt.Errorf("unknown link method %q", method)
 }
 
-// HandleResponse processes a link-namespace response.
-func (ls *Links) HandleResponse(peer, method string, payload json.RawMessage, ok bool) {
+// HandleResponse dispatches a sync response by namespace.
+func (ls *Links) HandleResponse(peer, fullMethod string, payload json.RawMessage, ok bool, ts int64) []string {
+	ns, method := splitMethod(fullMethod)
+	if ns == "link" {
+		ls.handleLinkResponse(peer, method, payload, ok)
+		return nil
+	}
+	mod := ls.moduleMap[ns]
+	if mod == nil {
+		return nil
+	}
+	return mod.HandleResponse(peer, method, payload, ok, ts)
+}
+
+// handleLinkResponse processes a link-namespace response.
+func (ls *Links) handleLinkResponse(peer, method string, payload json.RawMessage, ok bool) {
 	l := ls.Get(peer)
 	if l == nil {
 		return
@@ -322,8 +402,36 @@ func (ls *Links) HandleResponse(peer, method string, payload json.RawMessage, ok
 	}
 }
 
-// NextTx returns the next link-level message to send, or nil.
+// NextTx returns the next message to send on a peer link.
+// Link-level messages (connect/close/module) have absolute priority.
+// Among registered modules, the oldest QueuedAt wins.
 func (ls *Links) NextTx(peer string) *QueuedMsg {
+	// Link-level messages have absolute priority.
+	if msg := ls.linkNextTx(peer); msg != nil {
+		msg.Method = "link." + msg.Method
+		return msg
+	}
+	lk := ls.Get(peer)
+	if lk == nil || lk.State.Status != Connected {
+		return nil
+	}
+	var best *QueuedMsg
+	for name, mod := range ls.moduleMap {
+		if !lk.ModuleEnabled(name) {
+			continue
+		}
+		if msg := mod.NextTx(peer); msg != nil {
+			msg.Method = name + "." + msg.Method
+			if OlderQueuedMsg(msg, best) {
+				best = msg
+			}
+		}
+	}
+	return best
+}
+
+// linkNextTx returns the next link-level message to send, or nil.
+func (ls *Links) linkNextTx(peer string) *QueuedMsg {
 	l := ls.Get(peer)
 	if l == nil {
 		return nil
@@ -412,9 +520,23 @@ func (l *Link) respModule(payload json.RawMessage, ok bool) {
 // Account operations
 // ---------------------------------------------------------------------------
 
-// HandleAccount processes a link-namespace account operation.
+// HandleAccount dispatches an account API call by namespace.
 // Returns (result, peersToKick, error).
-func (ls *Links) HandleAccount(method string, payload json.RawMessage) (json.RawMessage, []string, error) {
+func (ls *Links) HandleAccount(fullMethod string, payload json.RawMessage) (json.RawMessage, []string, error) {
+	ns, method := splitMethod(fullMethod)
+	if ns == "link" {
+		return ls.handleLinkAccount(method, payload)
+	}
+	mod := ls.moduleMap[ns]
+	if mod == nil {
+		return nil, nil, fmt.Errorf("unknown method %q", fullMethod)
+	}
+	result, err := mod.HandleAccount(method, payload)
+	return result, nil, err
+}
+
+// handleLinkAccount processes a link-namespace account operation.
+func (ls *Links) handleLinkAccount(method string, payload json.RawMessage) (json.RawMessage, []string, error) {
 	switch method {
 	case "set_invite_mode":
 		var p struct {
