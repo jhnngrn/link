@@ -83,13 +83,16 @@ type LinkState struct {
 // that need kicking on other links (cross-link side effects).
 // HandleResponse returns kicks for the same purpose.
 // HandleAccount handles user-facing API calls.
-// NextTx returns the next queued message to send on a peer, or nil.
+// NextTx returns the next queued message to send on a peer.
+// Returns (method, payload, queuedAt). Empty method means nothing to send.
+// queuedAt is the unix-second timestamp of when the message was first queued;
+// when multiple modules return a candidate for the same peer, the oldest wins.
 type Module interface {
 	Name() string
 	HandleRequest(peer, method string, payload json.RawMessage, ts int64) (bool, []string, error)
 	HandleResponse(peer, method string, payload json.RawMessage, ok bool, ts int64) []string
 	HandleAccount(method string, payload json.RawMessage) (json.RawMessage, []string, error)
-	NextTx(peer string) *QueuedMsg
+	NextTx(peer string) (string, json.RawMessage, int64)
 }
 
 // QueuedMsg is a message queued for sending on a link.
@@ -452,8 +455,13 @@ func (ls *Links) nextTx(peer string) *QueuedMsg {
 		if !lk.ModuleEnabled(name) {
 			continue
 		}
-		if msg := mod.NextTx(peer); msg != nil {
-			msg.Method = name + "." + msg.Method
+		method, payload, queuedAt := mod.NextTx(peer)
+		if method != "" {
+			msg := &QueuedMsg{
+				Method:   name + "." + method,
+				Payload:  payload,
+				QueuedAt: queuedAt,
+			}
 			if OlderQueuedMsg(msg, best) {
 				best = msg
 			}
