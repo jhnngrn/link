@@ -107,16 +107,14 @@ type QueuedMsg struct {
 }
 
 // PeerSend tracks the outgoing send lifecycle for a link at a given counter.
-// InFlight means a goroutine is blocked on Send.
-// After the send completes, a retry timer is set: Refractory after error
-// (blocks kicks), non-refractory after success (fallback, kicks bypass).
-// Both are scoped to Counter — if counter advances via HandleSync,
-// the entry is stale and ignored.
+// InFlight means a goroutine is blocked on send. After a failed send,
+// a retry Timer is set that blocks kicks until it fires.
+// Scoped to Counter — if counter advances via HandleSync, the entry
+// is stale and ignored.
 type PeerSend struct {
-	Counter    uint64
-	InFlight   bool
-	Timer      *time.Timer
-	Refractory bool
+	Counter  uint64
+	InFlight bool
+	Timer    *time.Timer
 }
 
 // Link holds the sync state for a bilateral connection.
@@ -879,7 +877,7 @@ func (ls *Links) sendPending(peer string) {
 		return
 	}
 	if s := lk.Sending; s != nil {
-		if s.Counter == lk.Counter && (s.InFlight || s.Refractory) {
+		if s.Counter == lk.Counter && (s.InFlight || s.Timer != nil) {
 			ls.mu.Unlock()
 			return
 		}
@@ -923,13 +921,13 @@ func (ls *Links) sendPending(peer string) {
 	ls.mu.Lock()
 	if err != nil {
 		log.Printf("[link] %s->%s %s: %v", ls.self, peer, msg.Method, err)
-		ls.setRetry(peer, counter, true)
+		ls.setRetry(peer, counter)
 		ls.mu.Unlock()
 		return
 	}
 	var resp SyncResponse
 	if json.Unmarshal(body, &resp) != nil {
-		ls.setRetry(peer, counter, true)
+		ls.setRetry(peer, counter)
 		ls.mu.Unlock()
 		return
 	}
@@ -944,7 +942,7 @@ func (ls *Links) sendPending(peer string) {
 
 	if err := lk.ValidateTimestamp(resp.Timestamp, nowSecs()); err != nil {
 		log.Printf("[link] %s->%s: bad response timestamp: %v", ls.self, peer, err)
-		ls.setRetry(peer, counter, true)
+		ls.setRetry(peer, counter)
 		ls.mu.Unlock()
 		return
 	}
@@ -969,7 +967,7 @@ func (ls *Links) sendPending(peer string) {
 }
 
 // setRetry sets a per-peer retry timer. Caller must hold Lock.
-func (ls *Links) setRetry(peer string, counter uint64, refractory bool) {
+func (ls *Links) setRetry(peer string, counter uint64) {
 	if ls.stopped {
 		return
 	}
@@ -982,7 +980,6 @@ func (ls *Links) setRetry(peer string, counter uint64, refractory bool) {
 	}
 	ps := &PeerSend{
 		Counter:    counter,
-		Refractory: refractory,
 	}
 	ps.Timer = time.AfterFunc(retryDelay, func() {
 		ls.mu.Lock()
