@@ -540,9 +540,91 @@ func (ls *Links) HandleAccount(fullMethod string, payload json.RawMessage) (json
 	var kicks []string
 	var err error
 
-	if ns == "link" {
-		result, kicks, err = ls.handleLinkAccount(method, payload)
-	} else {
+	switch {
+	case ns == "link" && method == "set_invite_mode":
+		var p struct {
+			Mode InviteMode `json:"mode"`
+		}
+		if err = json.Unmarshal(payload, &p); err != nil {
+			ls.mu.Unlock()
+			return nil, fmt.Errorf("bad request")
+		}
+		switch p.Mode {
+		case InviteModeClosed, InviteModeInvite, InviteModeOpen:
+		default:
+			ls.mu.Unlock()
+			return nil, fmt.Errorf("invalid mode %q", p.Mode)
+		}
+		ls.InviteMode = p.Mode
+		result = enc("ok")
+
+	case ns == "link" && method == "set_modules":
+		var p struct {
+			Peer    string   `json:"peer"`
+			Modules []string `json:"modules"`
+		}
+		if err = json.Unmarshal(payload, &p); err != nil {
+			ls.mu.Unlock()
+			return nil, fmt.Errorf("bad request")
+		}
+		lk := ls.Get(p.Peer)
+		if lk == nil {
+			ls.mu.Unlock()
+			return nil, fmt.Errorf("no link to %s", p.Peer)
+		}
+		lk.SetModules(p.Modules, ls.moduleMap, ls.Protected)
+		result = enc("ok")
+		kicks = []string{p.Peer}
+
+	case ns == "link" && method == "accept_module":
+		var p struct {
+			Peer   string `json:"peer"`
+			Module string `json:"module"`
+		}
+		if err = json.Unmarshal(payload, &p); err != nil {
+			ls.mu.Unlock()
+			return nil, fmt.Errorf("bad request")
+		}
+		lk := ls.Get(p.Peer)
+		if lk == nil {
+			ls.mu.Unlock()
+			return nil, fmt.Errorf("no link to %s", p.Peer)
+		}
+		if err = lk.AcceptModule(p.Module); err != nil {
+			ls.mu.Unlock()
+			return nil, fmt.Errorf("no incoming module %s from %s", p.Module, p.Peer)
+		}
+		result = enc("ok")
+		kicks = []string{p.Peer}
+
+	case ns == "link" && method == "reject_module":
+		var p struct {
+			Peer   string `json:"peer"`
+			Module string `json:"module"`
+		}
+		if err = json.Unmarshal(payload, &p); err != nil {
+			ls.mu.Unlock()
+			return nil, fmt.Errorf("bad request")
+		}
+		lk := ls.Get(p.Peer)
+		if lk == nil {
+			ls.mu.Unlock()
+			return nil, fmt.Errorf("no link to %s", p.Peer)
+		}
+		if err = lk.RejectModule(p.Module); err != nil {
+			ls.mu.Unlock()
+			return nil, fmt.Errorf("no incoming module %s from %s", p.Module, p.Peer)
+		}
+		result = enc("ok")
+
+	case ns == "link" && method == "status":
+		result = ls.Status()
+
+	case ns == "link":
+		ls.mu.Unlock()
+		return nil, fmt.Errorf("unknown link method %q", method)
+
+	default:
 		mod := ls.moduleMap[ns]
 		if mod == nil {
 			ls.mu.Unlock()
@@ -561,79 +643,6 @@ func (ls *Links) HandleAccount(fullMethod string, payload json.RawMessage) (json
 		ls.Kick(k)
 	}
 	return result, err
-}
-
-// handleLinkAccount processes a link-namespace account operation.
-func (ls *Links) handleLinkAccount(method string, payload json.RawMessage) (json.RawMessage, []string, error) {
-	switch method {
-	case "set_invite_mode":
-		var p struct {
-			Mode InviteMode `json:"mode"`
-		}
-		if err := json.Unmarshal(payload, &p); err != nil {
-			return nil, nil, fmt.Errorf("bad request")
-		}
-		switch p.Mode {
-		case InviteModeClosed, InviteModeInvite, InviteModeOpen:
-		default:
-			return nil, nil, fmt.Errorf("invalid mode %q", p.Mode)
-		}
-		ls.InviteMode = p.Mode
-		return enc("ok"), nil, nil
-
-	case "set_modules":
-		var p struct {
-			Peer    string   `json:"peer"`
-			Modules []string `json:"modules"`
-		}
-		if err := json.Unmarshal(payload, &p); err != nil {
-			return nil, nil, fmt.Errorf("bad request")
-		}
-		lk := ls.Get(p.Peer)
-		if lk == nil {
-			return nil, nil, fmt.Errorf("no link to %s", p.Peer)
-		}
-		lk.SetModules(p.Modules, ls.moduleMap, ls.Protected)
-		return enc("ok"), []string{p.Peer}, nil
-
-	case "accept_module":
-		var p struct {
-			Peer   string `json:"peer"`
-			Module string `json:"module"`
-		}
-		if err := json.Unmarshal(payload, &p); err != nil {
-			return nil, nil, fmt.Errorf("bad request")
-		}
-		lk := ls.Get(p.Peer)
-		if lk == nil {
-			return nil, nil, fmt.Errorf("no link to %s", p.Peer)
-		}
-		if err := lk.AcceptModule(p.Module); err != nil {
-			return nil, nil, fmt.Errorf("no incoming module %s from %s", p.Module, p.Peer)
-		}
-		return enc("ok"), []string{p.Peer}, nil
-
-	case "reject_module":
-		var p struct {
-			Peer   string `json:"peer"`
-			Module string `json:"module"`
-		}
-		if err := json.Unmarshal(payload, &p); err != nil {
-			return nil, nil, fmt.Errorf("bad request")
-		}
-		lk := ls.Get(p.Peer)
-		if lk == nil {
-			return nil, nil, fmt.Errorf("no link to %s", p.Peer)
-		}
-		if err := lk.RejectModule(p.Module); err != nil {
-			return nil, nil, fmt.Errorf("no incoming module %s from %s", p.Module, p.Peer)
-		}
-		return enc("ok"), nil, nil
-
-	case "status":
-		return ls.Status(), nil, nil
-	}
-	return nil, nil, fmt.Errorf("unknown link method %q", method)
 }
 
 // Status returns the link collection status as JSON.
