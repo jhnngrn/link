@@ -127,7 +127,7 @@ type Link struct {
 	Pending        *QueuedMsg    `json:"pending,omitempty"`
 	CachedResponse *SyncResponse `json:"cached_response,omitempty"`
 	Timestamp      int64         `json:"ts"`
-	Send           *PeerSend     `json:"-"`
+	Sending        *PeerSend     `json:"-"`
 }
 
 // ModuleEnabled returns true if the named module is bilaterally active on this link.
@@ -165,10 +165,10 @@ type Links struct {
 	InviteMode InviteMode
 	Protected  map[string]struct{} // modules that SetModules cannot remove
 	moduleMap  map[string]Module
-	// Send delivers a sync message to a peer and returns the response body.
-	Send   func(peer string, msg SyncRequest) ([]byte, error)
-	// Commit persists the current state. Called under the mutex.
-	Commit func()
+	// send delivers a sync message to a peer and returns the response body.
+	send   func(peer string, msg SyncRequest) ([]byte, error)
+	// commit persists the current state. Called under the mutex.
+	commit func()
 	timers  []*time.Timer
 	stopped bool
 }
@@ -181,7 +181,7 @@ func NewLinks(self string, m map[string]*Link, mode InviteMode, send func(string
 	if mode == "" {
 		mode = InviteModeInvite
 	}
-	return &Links{m: m, self: self, InviteMode: mode, Protected: map[string]struct{}{}, moduleMap: map[string]Module{}, Send: send, Commit: commit}
+	return &Links{m: m, self: self, InviteMode: mode, Protected: map[string]struct{}{}, moduleMap: map[string]Module{}, send: send, commit: commit}
 }
 
 // Self returns the node identity.
@@ -420,27 +420,27 @@ func (ls *Links) dispatchResponse(peer, fullMethod string, payload json.RawMessa
 // Among registered modules, the oldest QueuedAt wins.
 func (ls *Links) nextTx(peer string) *QueuedMsg {
 	// Link-level messages have absolute priority.
-	l := ls.Get(peer)
-	if l != nil {
-		if l.State.IntentClose && l.State.Refs == 0 {
-			return &QueuedMsg{Method: "link.close"}
-		}
-		if l.State.IntentConnect {
-			return &QueuedMsg{Method: "link.connect"}
-		}
-		if l.State.Status == Connected {
-			for name, mod := range l.State.Modules {
-				if mod.IntentConnect {
-					return &QueuedMsg{
-						Method:  "link.module",
-						Payload: enc(map[string]string{"name": name}),
-					}
+	lk := ls.Get(peer)
+	if lk == nil {
+		return nil
+	}
+	if lk.State.IntentClose && lk.State.Refs == 0 {
+		return &QueuedMsg{Method: "link.close"}
+	}
+	if lk.State.IntentConnect {
+		return &QueuedMsg{Method: "link.connect"}
+	}
+	if lk.State.Status == Connected {
+		for name, mod := range lk.State.Modules {
+			if mod.IntentConnect {
+				return &QueuedMsg{
+					Method:  "link.module",
+					Payload: enc(map[string]string{"name": name}),
 				}
 			}
 		}
 	}
-	lk := ls.Get(peer)
-	if lk == nil || lk.State.Status != Connected {
+	if lk.State.Status != Connected {
 		return nil
 	}
 	var best *QueuedMsg
@@ -556,7 +556,7 @@ func (ls *Links) HandleAccount(fullMethod string, payload json.RawMessage) (json
 	}
 
 	if err == nil {
-		ls.Commit()
+		ls.commit()
 	}
 	ls.mu.Unlock()
 	for _, k := range kicks {
@@ -754,7 +754,7 @@ func (ls *Links) HandleSync(env SyncRequest) (*SyncResponse, error) {
 		}
 		pbKicks := ls.dispatchResponse(env.From, lk.Pending.Method, lk.Pending.Payload, env.Resp.OK, env.Resp.Timestamp)
 		lk.AcceptResponse(env.Resp.Timestamp)
-		ls.Commit()
+		ls.commit()
 		for _, k := range pbKicks {
 			ls.Kick(k)
 		}
@@ -791,7 +791,7 @@ func (ls *Links) HandleSync(env SyncRequest) (*SyncResponse, error) {
 	}
 
 	resp := lk.AcceptRequest(env.Counter, ok, ts)
-	ls.Commit()
+	ls.commit()
 	ls.mu.Unlock()
 	ls.Kick(env.From)
 	for _, k := range kicks {
@@ -836,7 +836,7 @@ func (ls *Links) Schedule(delay time.Duration, fn func() []string) {
 			return
 		}
 		kicks := fn()
-		ls.Commit()
+		ls.commit()
 		ls.mu.Unlock()
 		for _, k := range kicks {
 			ls.Kick(k)
@@ -859,9 +859,9 @@ func (ls *Links) Stop() {
 	}
 	ls.timers = nil
 	for _, lk := range ls.m {
-		if lk.Send != nil && lk.Send.Timer != nil {
-			lk.Send.Timer.Stop()
-			lk.Send = nil
+		if lk.Sending != nil && lk.Sending.Timer != nil {
+			lk.Sending.Timer.Stop()
+			lk.Sending = nil
 		}
 	}
 	ls.mu.Unlock()
@@ -878,7 +878,7 @@ func (ls *Links) sendPending(peer string) {
 		ls.mu.Unlock()
 		return
 	}
-	if s := lk.Send; s != nil {
+	if s := lk.Sending; s != nil {
 		if s.Counter == lk.Counter && (s.InFlight || s.Refractory) {
 			ls.mu.Unlock()
 			return
@@ -886,7 +886,7 @@ func (ls *Links) sendPending(peer string) {
 		if s.Timer != nil {
 			s.Timer.Stop()
 		}
-		lk.Send = nil
+		lk.Sending = nil
 	}
 	promoted := false
 	if lk.Pending == nil {
@@ -898,7 +898,7 @@ func (ls *Links) sendPending(peer string) {
 		promoted = true
 	}
 	counter := lk.Counter
-	lk.Send = &PeerSend{Counter: counter, InFlight: true}
+	lk.Sending = &PeerSend{Counter: counter, InFlight: true}
 	msg := lk.Pending
 	env := SyncRequest{
 		From: ls.self, To: peer, Counter: counter,
@@ -914,11 +914,11 @@ func (ls *Links) sendPending(peer string) {
 		env.Resp = cr
 	}
 	if promoted {
-		ls.Commit()
+		ls.commit()
 	}
 	ls.mu.Unlock()
 
-	body, err := ls.Send(peer, env)
+	body, err := ls.send(peer, env)
 
 	ls.mu.Lock()
 	if err != nil {
@@ -936,7 +936,7 @@ func (ls *Links) sendPending(peer string) {
 	lk = ls.Get(peer)
 	if lk == nil || lk.Pending != msg || lk.Counter != counter || resp.Counter != counter {
 		if lk != nil {
-			lk.Send = nil
+			lk.Sending = nil
 		}
 		ls.mu.Unlock()
 		return
@@ -957,8 +957,8 @@ func (ls *Links) sendPending(peer string) {
 		lk.Pending = ls.nextTx(peer)
 		kickPeer = lk.Pending != nil
 	}
-	ls.Commit()
-	lk.Send = nil
+	ls.commit()
+	lk.Sending = nil
 	ls.mu.Unlock()
 	if kickPeer {
 		ls.Kick(peer)
@@ -977,8 +977,8 @@ func (ls *Links) setRetry(peer string, counter uint64, refractory bool) {
 	if lk == nil {
 		return
 	}
-	if lk.Send != nil && lk.Send.Timer != nil {
-		lk.Send.Timer.Stop()
+	if lk.Sending != nil && lk.Sending.Timer != nil {
+		lk.Sending.Timer.Stop()
 	}
 	ps := &PeerSend{
 		Counter:    counter,
@@ -986,11 +986,11 @@ func (ls *Links) setRetry(peer string, counter uint64, refractory bool) {
 	}
 	ps.Timer = time.AfterFunc(retryDelay, func() {
 		ls.mu.Lock()
-		if lk := ls.Get(peer); lk != nil && lk.Send == ps {
-			lk.Send = nil
+		if lk := ls.Get(peer); lk != nil && lk.Sending == ps {
+			lk.Sending = nil
 		}
 		ls.mu.Unlock()
 		ls.sendPending(peer)
 	})
-	lk.Send = ps
+	lk.Sending = ps
 }
