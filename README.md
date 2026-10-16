@@ -8,7 +8,7 @@ Crash-safe bilateral channel with a shared counter — one decision in flight at
 - **Links** — collection of links with policy, module dispatch, and the full sync loop (incoming, outgoing, retry, scheduling)
 - **Module** — interface for application modules: HandleRequest, HandleResponse, HandleAccount, NextTx
 - **Wire types** — SyncRequest, SyncResponse envelopes
-- **PeerSend** — runtime send lifecycle tracking (in-flight, refractory, retry timer)
+- **PeerSend** — runtime send lifecycle tracking (in-flight, retry timer)
 
 ## Usage
 
@@ -31,7 +31,7 @@ ls.RegisterModule(myModule)
 resp, err := ls.HandleSync(env)
 
 // Account API — Links handles locking, commit, and kicks internally
-result, err := ls.HandleAccount("set_modules", payload)
+result, err := ls.HandleAccount("link.set_modules", payload)
 
 // Resume pending sends at boot
 ls.KickAll()
@@ -67,9 +67,11 @@ type Module interface {
     // Admin/account operation (not sync). Return (response, kicks, err).
     HandleAccount(method string, payload json.RawMessage) (json.RawMessage, []string, error)
 
-    // Pull next outgoing message for peer: (method, payload, ttl).
-    // Empty method means nothing to send. Links polls this — the module
-    // decides internally what's next: a queue, a state machine, whatever fits.
+    // Pull next outgoing message for peer: (method, payload, queuedAt).
+    // Empty method means nothing to send. queuedAt is unix seconds —
+    // when multiple modules have a message for the same peer, oldest wins.
+    // Links polls this — the module decides internally what's next:
+    // a queue, a state machine, whatever fits.
     NextTx(peer string) (string, json.RawMessage, int64)
 }
 ```
