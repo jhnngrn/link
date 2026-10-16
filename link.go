@@ -152,17 +152,10 @@ func NewLink(self, peer string) *Link {
 // Links — collection of links for a node, including the sync loop
 // ---------------------------------------------------------------------------
 
-// EngineConfig provides the callbacks Links needs to run the sync loop.
-type EngineConfig struct {
-	// Send delivers a sync message to a peer and returns the response body.
-	Send func(peer string, msg SyncRequest) ([]byte, error)
-	// Commit persists the current state. Called under the mutex.
-	Commit func()
-	// Now returns the current time as unix seconds.
-	Now func() int64
-	// RetryDelay is the delay between retry attempts.
-	RetryDelay time.Duration
-}
+const retryDelay = 60 * time.Second
+
+// nowSecs returns the current time as unix seconds.
+func nowSecs() int64 { return time.Now().Unix() }
 
 // Links manages the set of bilateral links for a node.
 type Links struct {
@@ -172,23 +165,23 @@ type Links struct {
 	InviteMode InviteMode
 	Protected  map[string]struct{} // modules that SetModules cannot remove
 	moduleMap  map[string]Module
-	engine  EngineConfig
+	// Send delivers a sync message to a peer and returns the response body.
+	Send   func(peer string, msg SyncRequest) ([]byte, error)
+	// Commit persists the current state. Called under the mutex.
+	Commit func()
 	timers  []*time.Timer
 	stopped bool
 }
 
 // NewLinks creates a Links collection for the given node identity.
-func NewLinks(self string, m map[string]*Link, mode InviteMode, engine EngineConfig) *Links {
+func NewLinks(self string, m map[string]*Link, mode InviteMode, send func(string, SyncRequest) ([]byte, error), commit func()) *Links {
 	if m == nil {
 		m = map[string]*Link{}
 	}
 	if mode == "" {
 		mode = InviteModeInvite
 	}
-	if engine.RetryDelay == 0 {
-		engine.RetryDelay = 60 * time.Second
-	}
-	return &Links{m: m, self: self, InviteMode: mode, Protected: map[string]struct{}{}, moduleMap: map[string]Module{}, engine: engine}
+	return &Links{m: m, self: self, InviteMode: mode, Protected: map[string]struct{}{}, moduleMap: map[string]Module{}, Send: send, Commit: commit}
 }
 
 // Self returns the node identity.
@@ -563,7 +556,7 @@ func (ls *Links) HandleAccount(fullMethod string, payload json.RawMessage) (json
 	}
 
 	if err == nil {
-		ls.engine.Commit()
+		ls.Commit()
 	}
 	ls.mu.Unlock()
 	for _, k := range kicks {
@@ -733,7 +726,7 @@ func (ls *Links) HandleSync(env SyncRequest) (*SyncResponse, error) {
 	if lk == nil {
 		if env.Method == "link.close" {
 			ls.mu.Unlock()
-			return &SyncResponse{Counter: env.Counter, OK: true, Timestamp: ls.engine.Now()}, nil
+			return &SyncResponse{Counter: env.Counter, OK: true, Timestamp: nowSecs()}, nil
 		}
 		if env.Method != "link.connect" {
 			ls.mu.Unlock()
@@ -751,7 +744,7 @@ func (ls *Links) HandleSync(env SyncRequest) (*SyncResponse, error) {
 		lk.State.Status = Incoming
 	}
 
-	now := ls.engine.Now()
+	now := nowSecs()
 
 	// Piggybacked response.
 	if env.Resp != nil && lk.Pending != nil && env.Resp.Counter == lk.Counter {
@@ -761,7 +754,7 @@ func (ls *Links) HandleSync(env SyncRequest) (*SyncResponse, error) {
 		}
 		pbKicks := ls.dispatchResponse(env.From, lk.Pending.Method, lk.Pending.Payload, env.Resp.OK, env.Resp.Timestamp)
 		lk.AcceptResponse(env.Resp.Timestamp)
-		ls.engine.Commit()
+		ls.Commit()
 		for _, k := range pbKicks {
 			ls.Kick(k)
 		}
@@ -798,7 +791,7 @@ func (ls *Links) HandleSync(env SyncRequest) (*SyncResponse, error) {
 	}
 
 	resp := lk.AcceptRequest(env.Counter, ok, ts)
-	ls.engine.Commit()
+	ls.Commit()
 	ls.mu.Unlock()
 	ls.Kick(env.From)
 	for _, k := range kicks {
@@ -843,7 +836,7 @@ func (ls *Links) Schedule(delay time.Duration, fn func() []string) {
 			return
 		}
 		kicks := fn()
-		ls.engine.Commit()
+		ls.Commit()
 		ls.mu.Unlock()
 		for _, k := range kicks {
 			ls.Kick(k)
@@ -912,7 +905,7 @@ func (ls *Links) sendPending(peer string) {
 		Method: msg.Method, Payload: msg.Payload,
 	}
 	if lk.Dominant() {
-		env.Timestamp = ls.engine.Now()
+		env.Timestamp = nowSecs()
 		if env.Timestamp < lk.Timestamp {
 			env.Timestamp = lk.Timestamp
 		}
@@ -921,11 +914,11 @@ func (ls *Links) sendPending(peer string) {
 		env.Resp = cr
 	}
 	if promoted {
-		ls.engine.Commit()
+		ls.Commit()
 	}
 	ls.mu.Unlock()
 
-	body, err := ls.engine.Send(peer, env)
+	body, err := ls.Send(peer, env)
 
 	ls.mu.Lock()
 	if err != nil {
@@ -949,7 +942,7 @@ func (ls *Links) sendPending(peer string) {
 		return
 	}
 
-	if err := lk.ValidateTimestamp(resp.Timestamp, ls.engine.Now()); err != nil {
+	if err := lk.ValidateTimestamp(resp.Timestamp, nowSecs()); err != nil {
 		log.Printf("[link] %s->%s: bad response timestamp: %v", ls.self, peer, err)
 		ls.setRetry(peer, counter, true)
 		ls.mu.Unlock()
@@ -964,7 +957,7 @@ func (ls *Links) sendPending(peer string) {
 		lk.Pending = ls.nextTx(peer)
 		kickPeer = lk.Pending != nil
 	}
-	ls.engine.Commit()
+	ls.Commit()
 	lk.Send = nil
 	ls.mu.Unlock()
 	if kickPeer {
@@ -991,7 +984,7 @@ func (ls *Links) setRetry(peer string, counter uint64, refractory bool) {
 		Counter:    counter,
 		Refractory: refractory,
 	}
-	ps.Timer = time.AfterFunc(ls.engine.RetryDelay, func() {
+	ps.Timer = time.AfterFunc(retryDelay, func() {
 		ls.mu.Lock()
 		if lk := ls.Get(peer); lk != nil && lk.Send == ps {
 			lk.Send = nil

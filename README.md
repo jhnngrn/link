@@ -7,7 +7,6 @@ Crash-safe bilateral channel with a shared counter — one decision in flight at
 - **Link** — bilateral sync state for one connection: counter, turn bit, pending message, cached response, timestamps
 - **Links** — collection of links with policy, module dispatch, and the full sync loop (incoming, outgoing, retry, scheduling)
 - **Module** — interface for application modules: HandleRequest, HandleResponse, HandleAccount, NextTx
-- **EngineConfig** — callbacks the sync loop needs: Send, Commit, Now
 - **Wire types** — SyncRequest, SyncResponse envelopes
 - **PeerSend** — runtime send lifecycle tracking (in-flight, refractory, retry timer)
 
@@ -16,15 +15,14 @@ Crash-safe bilateral channel with a shared counter — one decision in flight at
 ```go
 import "github.com/jhnngrn/link"
 
-// Engine callbacks — the app provides transport and persistence.
-engine := link.EngineConfig{
-    Send:   func(peer string, msg link.SyncRequest) ([]byte, error) { ... },
-    Commit: func() { /* serialize and persist */ },
-    Now:    func() int64 { return time.Now().Unix() },
-}
-
 // Create a collection for node "alice"
-ls := link.NewLinks("alice", nil, link.InviteModeInvite, engine)
+ls := link.NewLinks("alice", nil, link.InviteModeInvite,
+    func(peer string, msg link.SyncRequest) ([]byte, error) {
+        // POST msg to peer, return response body
+        return nil, nil
+    },
+    func() { /* serialize and persist */ },
+)
 
 // Register application modules
 ls.RegisterModule(myModule)
@@ -122,6 +120,6 @@ Links runs the outgoing sync loop internally:
 - **Kick(peer)** — triggers a send attempt for a peer (async)
 - **KickAll()** — kicks all peers, used at boot to resume pending work
 - **Schedule(delay, fn)** — runs fn after delay under the Links mutex, commits and kicks any peers fn returns. General-purpose deferred operation — not tied to any specific link or module
-- **sendPending(peer)** — acquires the lock, calls NextTx, sends via EngineConfig.Send, handles the response, retries on failure
+- **sendPending(peer)** — acquires the lock, calls NextTx, sends via Send, handles the response, retries on failure
 - **QuickReject(from, method)** — fast pre-auth rejection before expensive signature verification
 - **HandleSync(env)** — incoming sync: validates, dispatches to modules, persists, kicks
